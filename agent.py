@@ -1,43 +1,54 @@
 """
-PDF Question-Answering Agent
-=============================
+PDF Question-Answering Agent -- Dockerized Chroma edition
+===========================================================
 
-A minimal but complete example of a LangChain *agent* (not just a chain)
-that can answer questions about the contents of a PDF file.
+Same agent as the earlier version, but the vector store is now a real,
+persistent database: a Chroma server running in Docker, rather than an
+in-process Python object. This is closer to how you'd run this in
+production, and it means indexed PDFs survive between runs.
 
-Architecture (see the diagram in the conversation for the visual version):
+Architecture:
 
   PDF file
      -> Load & split      (PyPDFLoader + RecursiveCharacterTextSplitter)
-     -> Embed & store     (OpenAIEmbeddings + Chroma vector store)
-     -> Retriever tool     (create_retriever_tool)
-     -> Agent (LLM)        (create_tool_calling_agent + AgentExecutor)
+     -> Embed             (OpenAIEmbeddings, called directly)
+     -> Store & search     (Chroma server in Docker, via chromadb-client over HTTP)
+     -> Retriever tool     (a small @tool-wrapped function, see below)
+     -> Agent (LLM)        (create_agent, LangChain v1's agent API)
      -> Answer
 
-Why an *agent* instead of a simple RetrievalQA chain?
-A plain retrieval chain ALWAYS searches the vector store once per question,
-even if the question doesn't need it ("hi", "thanks", "what's 2+2?").
-An agent is given the retriever as a *tool* and an LLM that decides, on its
-own, whether to call that tool, how many times, and with what search query.
-This is closer to how a real assistant should behave, and it generalizes:
-you can add more tools later (web search, a calculator, another database)
-without changing the control flow.
+Why not `langchain-chroma`?
+The official LangChain <-> Chroma integration package (`langchain-chroma`)
+declares the FULL `chromadb` package as a required dependency -- which
+pulls in `onnxruntime` and other compiled binaries that don't always have
+wheels for every OS/Python/architecture (this is what caused the earlier
+install failures). Since the Chroma *server* now runs inside a Linux
+container, we don't need any of that on the Mac side. Instead this script
+talks to the server directly using `chromadb-client`, a lightweight
+HTTP-only client with a minimal dependency footprint, and wraps the
+search as a plain LangChain tool with the `@tool` decorator.
 
-Usage:
+Prerequisites:
+    docker compose up -d          (starts the Chroma server, see docker-compose.yml)
     export OPENAI_API_KEY=sk-...
     python agent.py path/to/document.pdf
 """
 
 import os
+import re
 import sys
+import uuid
 
+import chromadb
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_chroma import Chroma
-from langchain.tools.retriever import create_retriever_tool
-from langchain.agents import create_tool_calling_agent, AgentExecutor
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+from langchain_core.tools import tool
+from langchain.agents import create_agent
+
+
+CHROMA_HOST = os.environ.get("CHROMA_HOST", "localhost")
+CHROMA_PORT = int(os.environ.get("CHROMA_PORT", "8000"))
 
 
 # ---------------------------------------------------------------------------
@@ -45,16 +56,10 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 # ---------------------------------------------------------------------------
 def load_and_split(pdf_path: str, chunk_size: int = 1000, chunk_overlap: int = 150):
     """
-    PyPDFLoader turns the PDF into one LangChain Document per page, each
-    carrying `page_content` (the text) and `metadata` (e.g. page number).
-
-    We then re-split those pages into smaller overlapping chunks:
-      - chunk_size: chunks that are too large produce noisy embeddings and
-        blow past what's useful in a prompt; too small loses context.
-        ~1000 characters (roughly 150-200 words) is a solid default for
-        prose-heavy PDFs.
-      - chunk_overlap: a little overlap (150 chars) prevents a sentence
-        that straddles a chunk boundary from losing meaning in both halves.
+    Same as before: PyPDFLoader turns the PDF into one Document per page,
+    then RecursiveCharacterTextSplitter breaks those into smaller
+    overlapping chunks sized for meaningful embeddings and precise
+    retrieval.
     """
     loader = PyPDFLoader(pdf_path)
     pages = loader.load()
@@ -69,81 +74,112 @@ def load_and_split(pdf_path: str, chunk_size: int = 1000, chunk_overlap: int = 1
 
 
 # ---------------------------------------------------------------------------
-# Step 3: Embed the chunks and store them in a local vector database
+# Step 3: Connect to the Chroma server and index chunks (if not already done)
 # ---------------------------------------------------------------------------
-def build_vectorstore(chunks, persist_directory: str = "./chroma_db"):
-    """
-    Each chunk of text is converted into a vector (a list of numbers that
-    captures its meaning) by the embeddings model, then stored in Chroma,
-    a lightweight local vector database. Later, a question is embedded the
-    same way, and Chroma finds the chunks whose vectors are closest to it
-    (semantic similarity), rather than requiring exact keyword matches.
-
-    persist_directory lets Chroma save to disk, so you don't have to
-    re-embed the PDF every time you run the script.
-    """
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=persist_directory,
-    )
-    return vectorstore
+def collection_name_for(pdf_path: str) -> str:
+    """Turn a filename into a safe, unique Chroma collection name."""
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    return "pdf_" + re.sub(r"[^a-zA-Z0-9_-]", "_", base).lower()
 
 
-# ---------------------------------------------------------------------------
-# Step 4: Wrap the vector store as a tool the agent can call
-# ---------------------------------------------------------------------------
-def build_retriever_tool(vectorstore, k: int = 4):
+def connect_to_chroma():
     """
-    create_retriever_tool packages a retriever as a LangChain Tool with a
-    name and a natural-language description. That description is what the
-    agent's LLM reads to decide *when* to use this tool -- so it needs to
-    clearly state what the tool is for.
+    Connects to the Chroma server over HTTP. This is the only network
+    dependency this script has on the vector store -- if the Docker
+    container isn't running, this fails fast with a clear message rather
+    than a confusing stack trace later.
     """
-    retriever = vectorstore.as_retriever(search_kwargs={"k": k})
-    tool = create_retriever_tool(
-        retriever,
-        name="search_pdf",
-        description=(
-            "Search the uploaded PDF document for relevant passages. "
-            "Use this whenever the user asks a question that might be "
-            "answered by the document's contents. Input should be a "
-            "focused search query, not the full user question verbatim."
-        ),
-    )
-    return tool
+    try:
+        client = chromadb.HttpClient(host=CHROMA_HOST, port=CHROMA_PORT)
+        client.heartbeat()
+    except Exception as exc:
+        print(
+            f"Could not reach the Chroma server at {CHROMA_HOST}:{CHROMA_PORT}.\n"
+            f"Start it with: docker compose up -d\n"
+            f"Underlying error: {exc}"
+        )
+        sys.exit(1)
+    return client
+
+
+def get_or_build_collection(client, pdf_path: str, embeddings: OpenAIEmbeddings):
+    """
+    Each PDF gets its own Chroma collection (named after the file), so
+    re-running on the same PDF reuses the already-indexed data -- real
+    persistence, unlike the in-memory version. Re-running on a different
+    PDF just creates a separate collection; nothing is overwritten.
+    """
+    name = collection_name_for(pdf_path)
+    collection = client.get_or_create_collection(name=name)
+
+    if collection.count() > 0:
+        print(f"Found existing indexed data for '{name}' ({collection.count()} chunks) -- reusing it.")
+        return collection
+
+    print(f"No existing index for '{name}'. Indexing {pdf_path} ...")
+    chunks = load_and_split(pdf_path)
+
+    texts = [c.page_content for c in chunks]
+    metadatas = [c.metadata for c in chunks]
+    ids = [str(uuid.uuid4()) for _ in chunks]
+    vectors = embeddings.embed_documents(texts)  # one API call embedding all chunks
+
+    collection.add(ids=ids, embeddings=vectors, documents=texts, metadatas=metadatas)
+    print(f"Indexed {len(chunks)} chunk(s) into collection '{name}'.")
+    return collection
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Build the tool-calling agent
+# Step 4: Wrap Chroma search as a tool the agent can call
 # ---------------------------------------------------------------------------
-def build_agent(tool, model: str = "gpt-4o-mini"):
+def build_search_tool(collection, embeddings: OpenAIEmbeddings, k: int = 4):
     """
-    create_tool_calling_agent binds the LLM, the list of tools, and a
-    prompt together. AgentExecutor then runs the actual loop:
-      1. Send the question (+ system prompt + tool descriptions) to the LLM.
-      2. If the LLM's response is a tool call, execute it and feed the
-         result back to the LLM.
-      3. Repeat until the LLM responds with a final answer instead of a
-         tool call.
+    Because we're talking to Chroma directly (not through a LangChain
+    VectorStoreRetriever), the tool is just a plain Python function
+    decorated with @tool. The docstring becomes the tool's description --
+    exactly what the agent's LLM reads to decide when to call it, so it
+    needs to clearly state what the tool is for.
+    """
+    @tool
+    def search_pdf(query: str) -> str:
+        """Search the uploaded PDF document for relevant passages. Use
+        this whenever the user asks a question that might be answered by
+        the document's contents. Input should be a focused search query,
+        not the full user question verbatim."""
+        query_vector = embeddings.embed_query(query)
+        results = collection.query(query_embeddings=[query_vector], n_results=k)
+        docs = results.get("documents", [[]])[0]
+        if not docs:
+            return "No relevant passages found in the document."
+        return "\n\n---\n\n".join(docs)
+
+    return search_pdf
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Build the agent
+# ---------------------------------------------------------------------------
+def build_agent(tool_fn, model: str = "gpt-4o-mini"):
+    """
+    Identical to the earlier version: create_agent binds an LLM and a
+    list of tools into a runnable agent. The agent decides on its own
+    whether to call search_pdf, how to phrase the query, and whether to
+    call it again before answering.
     """
     llm = ChatOpenAI(model=model, temperature=0)
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are a helpful assistant answering questions about a PDF "
-         "document. Use the search_pdf tool to find relevant passages "
-         "before answering. If the answer isn't in the document, say so "
-         "clearly instead of guessing. Keep answers concise and, where "
-         "useful, mention which part of the document supports your answer."),
-        ("human", "{input}"),
-        MessagesPlaceholder(variable_name="agent_scratchpad"),
-    ])
-
-    agent = create_tool_calling_agent(llm, [tool], prompt)
-    executor = AgentExecutor(agent=agent, tools=[tool], verbose=True)
-    return executor
+    agent = create_agent(
+        model=llm,
+        tools=[tool_fn],
+        system_prompt=(
+            "You are a helpful assistant answering questions about a PDF "
+            "document. Use the search_pdf tool to find relevant passages "
+            "before answering. If the answer isn't in the document, say so "
+            "clearly instead of guessing. Keep answers concise and, where "
+            "useful, mention which part of the document supports your answer."
+        ),
+    )
+    return agent
 
 
 # ---------------------------------------------------------------------------
@@ -163,11 +199,12 @@ def main():
         print("Set OPENAI_API_KEY before running (export OPENAI_API_KEY=sk-...).")
         sys.exit(1)
 
-    print(f"Indexing {pdf_path} ...")
-    chunks = load_and_split(pdf_path)
-    vectorstore = build_vectorstore(chunks)
-    tool = build_retriever_tool(vectorstore)
-    agent_executor = build_agent(tool)
+    client = connect_to_chroma()
+    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+    collection = get_or_build_collection(client, pdf_path, embeddings)
+
+    tool_fn = build_search_tool(collection, embeddings)
+    agent = build_agent(tool_fn)
 
     print("\nReady. Ask questions about the PDF (type 'exit' to quit).\n")
     while True:
@@ -177,8 +214,9 @@ def main():
         if not question:
             continue
 
-        result = agent_executor.invoke({"input": question})
-        print(f"\nAgent: {result['output']}\n")
+        result = agent.invoke({"messages": [{"role": "user", "content": question}]})
+        answer = result["messages"][-1].content
+        print(f"\nAgent: {answer}\n")
 
 
 if __name__ == "__main__":
