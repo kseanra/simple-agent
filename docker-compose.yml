@@ -1,6 +1,9 @@
 services:
   chroma:
-    image: chromadb/chroma:latest
+    # Pinned (was ":latest") so the server version can't drift out from
+    # under the pinned chromadb-client in requirements.txt. Upgrade this
+    # tag and the client pin together, never one without the other.
+    image: chromadb/chroma:1.5.9
     ports:
       - "8000:8000"
     volumes:
@@ -11,5 +14,27 @@ services:
       timeout: 3s
       retries: 10
 
+  # Persistent conversation store for the web app (web_app.py). The CLI
+  # agent (agent.py) doesn't use this. History now survives a uvicorn
+  # restart and is shared across multiple server workers, unlike the old
+  # in-memory dict.
+  redis:
+    image: redis:7.4-alpine
+    # Host port 6380 (container still listens on 6379) to avoid clashing
+    # with any Redis already running on the host's default 6379. The app
+    # defaults to 6380 to match; override with REDIS_PORT if you change it.
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    # Snapshot to disk so sessions survive a container restart.
+    command: ["redis-server", "--save", "60", "1", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
 volumes:
   chroma_data:
+  redis_data:

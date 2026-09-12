@@ -199,6 +199,29 @@
   }
   .bubble.assistant pre code { background: none; padding: 0; }
   .bubble.assistant a { color: inherit; text-decoration: underline; }
+  /* Citations shown under an assistant answer: the pages the agent's
+     retrieved passages came from, so a reader can verify the answer
+     against the source PDF. */
+  .citations {
+    align-self: flex-start;
+    max-width: 70%;
+    margin-top: -6px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .citations .cite-label {
+    font-weight: 600;
+    margin-right: 4px;
+  }
+  .citations .cite-chip {
+    display: inline-block;
+    background: var(--assistant-bubble);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 2px 8px;
+    margin: 2px 4px 2px 0;
+    cursor: default;
+  }
   .empty-state {
     margin: auto;
     text-align: center;
@@ -269,9 +292,9 @@
 
 <script>
   // A per-browser-tab conversation id, persisted in localStorage so a page
-  // refresh continues the same conversation (as far as the server's
-  // in-memory session store remembers it -- restarting the server clears
-  // this, since sessions live in a Python dict, not a database).
+  // refresh continues the same conversation. The server stores that
+  // conversation in Redis keyed by this id, so it survives a server
+  // restart and is shared across workers (until the session's TTL lapses).
   function getSessionId() {
     let id = localStorage.getItem("pdf_qa_session_id");
     if (!id) {
@@ -340,6 +363,31 @@
     messagesEl.appendChild(bubble);
     messagesEl.scrollTop = messagesEl.scrollHeight;
     return bubble;
+  }
+
+  // Render the citations block under an assistant answer. Each citation is
+  // a page the agent's supporting passages came from; hovering a chip
+  // shows a short snippet of that passage.
+  function addCitations(citations) {
+    if (!citations || citations.length === 0) return;
+    const wrap = document.createElement("div");
+    wrap.className = "citations";
+
+    const label = document.createElement("span");
+    label.className = "cite-label";
+    label.textContent = "Sources:";
+    wrap.appendChild(label);
+
+    for (const c of citations) {
+      const chip = document.createElement("span");
+      chip.className = "cite-chip";
+      chip.textContent = `page ${c.page_label}`;
+      if (c.snippet) chip.title = c.snippet;
+      wrap.appendChild(chip);
+    }
+
+    messagesEl.appendChild(wrap);
+    messagesEl.scrollTop = messagesEl.scrollHeight;
   }
 
   function selectDocument(documentId) {
@@ -421,6 +469,7 @@
       }
       const data = await res.json();
       addBubble("assistant", data.answer);
+      addCitations(data.citations);
       setStatus("");
     } catch (err) {
       addBubble("error", err.message);

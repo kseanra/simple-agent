@@ -82,10 +82,10 @@ its source file (`collection_name_for`) means:
 - **Multiple documents in one session**: build one tool per collection
   (or one tool that searches across several) and pass a list of tools to
   `create_agent`.
-- **Client/server version matching**: `chromadb-client`'s version should
-  stay reasonably close to the server image's version (both are pinned
-  loosely here via `:latest` and `>=1.0.0` -- for a production setup,
-  pin both explicitly and upgrade them together).
+- **Client/server version matching**: `chromadb-client` and the Chroma
+  server image are now pinned to the same version (`1.5.9`) in
+  `requirements.txt` and `docker-compose.yml` respectively. Keep them in
+  lockstep -- when you bump one, bump the other in the same change.
 - **Remote Chroma server**: since this already talks over HTTP, pointing
   at a Chroma instance running on another machine (or Chroma Cloud) is
   just a matter of changing `CHROMA_HOST`/`CHROMA_PORT`.

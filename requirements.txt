@@ -1,11 +1,29 @@
-langchain>=1.0.0
-langchain-openai>=1.0.0
-langchain-community>=0.4.0
-langchain-text-splitters>=1.0.0
-pypdf>=4.0.0
-chromadb-client>=1.0.0
+# Exact pins. LangChain reorganizes packages and APIs across releases, so
+# `>=` ranges let a later `pip install` silently pull a version with a
+# changed signature and break create_agent / @tool / the message format.
+# Upgrade these deliberately, together -- bump the numbers here in one
+# commit, re-run, and confirm nothing broke, rather than floating.
+langchain==1.4.0
+langchain-openai==1.6.2
+langchain-community==0.4.2
+langchain-text-splitters==1.1.2
+langchain-core==1.6.3
+pypdf==6.18.1
+
+# The Chroma HTTP client's version should track the server image it talks
+# to (docker-compose.yml pins chromadb/chroma to the SAME 1.5.x line).
+# Upgrade both in lockstep: change the image tag AND this pin together.
+chromadb-client==1.5.9
+
+# Cross-encoder reranking over the retrieved candidate set. CPU-only by
+# default; the model is downloaded once on first use and cached locally.
+sentence-transformers==3.3.1
+
+# Persistent, cross-process conversation state (replaces the in-memory
+# sessions dict). Talks to the redis service in docker-compose.yml.
+redis==5.2.1
 
 # Web application edition (web_app.py) -- not needed for the CLI agent.py
-fastapi>=0.115.0
-uvicorn[standard]>=0.30.0
-python-multipart>=0.0.9
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+python-multipart==0.0.32

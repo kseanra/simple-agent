@@ -9,7 +9,9 @@ can run either one (or both) against the same Chroma server.
 ## Running it
 
 ```bash
-# 1. Start the Chroma server (same one agent.py uses)
+# 1. Start the backing services: Chroma (shared with agent.py) and Redis
+#    (conversation store, web app only). Redis is published on host port
+#    6380 to avoid clashing with any Redis already on the default 6379.
 docker compose up -d
 
 # 2. Install dependencies (adds fastapi/uvicorn/python-multipart on top of
@@ -56,9 +58,12 @@ for as long as it stays up. That changes three things:
    In `agent.py`, the Python `while True` loop is itself the memory -- the
    messages list lives in a local variable across iterations. An HTTP
    request has no memory of the last one on its own, so the web app keeps
-   a small in-memory dictionary (`sessions`, keyed by a `session_id` the
-   browser generates and stores in `localStorage`) that plays the same
-   role the loop's local variable played in the CLI version.
+   each conversation in **Redis** (`SessionStore`, keyed by a `session_id`
+   the browser generates and stores in `localStorage`) that plays the same
+   role the loop's local variable played in the CLI version. Because it's
+   Redis rather than a process-local dict, history survives a `uvicorn`
+   restart and is shared across multiple server workers. Idle sessions
+   expire after a TTL (default 7 days, refreshed on every message).
 
 ## Request flow
 
@@ -81,19 +86,20 @@ Browser                     FastAPI (web_app.py)                  Chroma
 **Asking a question** (`POST /api/chat`):
 
 ```
-Browser                     FastAPI (web_app.py)                  Chroma / OpenAI
+Browser                     FastAPI (web_app.py)              Redis / Chroma / OpenAI
   |  {session_id, document_id, question}                            |
   |-------------------------------->|                                |
-  |                                 | look up session's message history
+  |                                 | load session history ----------> Redis GET
   |                                 | (reset if document_id changed)  |
   |                                 | append the new question         |
   |                                 | build a search_pdf tool scoped  |
   |                                 |   to this document's collection |
   |                                 | agent.invoke({"messages": ...}) |
-  |                                 |    -> LLM may call search_pdf ---> Chroma query
-  |                                 |    -> LLM reads results, answers -> OpenAI chat
-  |                                 | append the answer to history    |
-  |  <---- {answer} ----------------|                                |
+  |                                 |    -> LLM may call search_pdf ---> Chroma query (wide)
+  |                                 |    -> cross-encoder reranks -----> keep top FINAL_K
+  |                                 |    -> LLM reads passages, answers -> OpenAI chat
+  |                                 | save history ------------------> Redis SETEX
+  |  <-- {answer, citations[]} -----|  (citations = pages the passages came from)
 ```
 
 ## Design decisions worth calling out
@@ -109,19 +115,36 @@ one unambiguous answer, and a re-upload of something already indexed is
 recognized immediately rather than silently re-embedded (or worse, silently
 colliding with an unrelated file of the same name).
 
-**Why is conversation memory in-memory (a plain Python dict), and what
-does that cost you?** It's the simplest thing that demonstrates the idea,
-and it's genuinely fine for one person running this locally. It does mean:
-history is lost if you restart the `uvicorn` process, it isn't shared
-across multiple server processes (so it won't survive being deployed
-behind a load balancer with more than one worker), and there's no
-per-user isolation or authentication -- anyone who can reach the server and
-guess/receive a `session_id` can see that conversation. None of that
-matters for a local learning project; all of it matters before putting
-this in front of real users. The natural next step is a shared, persistent
-store (Redis, a database table, or LangGraph's own checkpointer/threads
-support) keyed the same way, plus real accounts if more than one person
-will use it.
+**Why is conversation memory in Redis?** An earlier version used a plain
+in-memory Python dict, which is the simplest thing that works for one
+person locally but loses all history on a `uvicorn` restart and isn't
+shared across workers (so it breaks behind a load balancer with more than
+one worker). `SessionStore` now keeps each conversation in Redis, keyed by
+`session_id`, as a JSON blob with a TTL that's refreshed on every message.
+That survives restarts and is shared across processes. What it still
+*doesn't* add is per-user isolation or authentication -- anyone who can
+reach the server and guess/receive a `session_id` can see that
+conversation -- so real accounts are still the next step before a public
+deployment.
+
+**Why rerank instead of trusting Chroma's top-k directly?** Vector
+similarity is a fast, approximate first pass: it finds passages whose
+embeddings are near the question's, but embedding distance and true
+relevance don't always agree. So `retrieve_and_rerank` fetches a *wide*
+candidate set (`CANDIDATE_K`, default 20) and runs a cross-encoder over
+each `(question, passage)` pair -- a model that reads the two together and
+scores how well the passage actually answers the question -- then keeps the
+best `FINAL_K` (default 4). The cross-encoder is far more accurate than
+distance alone but too slow to run over a whole collection, which is
+exactly why it's used as a *reranker* over a shortlist rather than as the
+primary search. It's a small CPU model, downloaded and cached on first use.
+
+**Why return citations?** The passages the agent actually used carry their
+PDF page numbers (`_page_label` reads them from PyPDFLoader's metadata).
+Those pages are prefixed into the text the LLM sees (so it can cite inline)
+*and* returned to the browser in `citations[]`, where they render as
+"page N" chips under the answer. A reader can then check the answer against
+the source instead of taking it on faith.
 
 **Why rebuild the agent (and its search tool) on every request instead of
 caching one per document?** Building `create_agent(...)` doesn't make any
@@ -137,14 +160,24 @@ conversation about a completely different PDF would actively mislead the
 agent. Since the chat history is really "history of this document,
 in this session," changing documents starts a clean one.
 
+## Already done
+
+- **Persistent sessions**: conversation history lives in Redis
+  (`SessionStore`), keyed by `session_id`, with a refreshing TTL -- survives
+  restarts and works across multiple workers.
+- **Reranked retrieval**: a cross-encoder reranks a wide candidate set down
+  to the final passages (`retrieve_and_rerank`), improving on raw vector
+  top-k. Chunk size/overlap are configurable per upload.
+- **Citations**: answers come back with the PDF pages their supporting
+  passages came from, shown as chips under each answer.
+
 ## Extending this
 
-- **Persist sessions**: swap the `sessions` dict for Redis or a database
-  table, keyed the same way, so history survives a restart and works
-  across more than one server process.
 - **Multiple documents per question**: build one `search_pdf` tool per
   selected document (or one tool that searches across several
   collections) and pass all of them to `create_agent`.
+- **Hybrid search**: combine keyword (BM25) with vector search before the
+  rerank step, so exact-term matches aren't missed by embeddings alone.
 - **Streaming answers**: `create_agent`'s underlying LangGraph runnable
   supports streaming; wiring that through Server-Sent Events or a
   WebSocket to the frontend would make answers appear incrementally
