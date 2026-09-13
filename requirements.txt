@@ -17,7 +17,15 @@ chromadb-client==1.5.9
 
 # Cross-encoder reranking over the retrieved candidate set. CPU-only by
 # default; the model is downloaded once on first use and cached locally.
+#
+# Pinned together with torch/numpy below: torch==2.2.2 is the last version
+# with official Intel-macOS wheels, and it predates NumPy 2.0's C-API/ABI
+# break, so it silently loses its numpy bridge ("Numpy is not available" in
+# CrossEncoder.predict) if numpy resolves to a 2.x release. Keep numpy on
+# the 1.26.x line here until upgrading torch is possible on this machine.
 sentence-transformers==3.3.1
+torch==2.2.2
+numpy==1.26.4
 
 # Persistent, cross-process conversation state (replaces the in-memory
 # sessions dict). Talks to the redis service in docker-compose.yml.
