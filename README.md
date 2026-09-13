@@ -36,6 +36,24 @@ pip install -r requirements.txt
 # 3. Set your API key and run
 export OPENAI_API_KEY=sk-...
 python agent.py path/to/document.pdf
+
+```
+
+## If on the old Intel Mac
+in requirment st
+
+torch==2.2.2
+
+numpy==1.26.4
+
+```bash
+cd ~/{Project}
+deactivate 2>/dev/null
+rm -rf venv
+python3.12 -m venv venv
+source venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
 ```
 
 Type `exit` to quit. Run it again on the same PDF and you'll see it skip

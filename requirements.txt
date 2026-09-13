@@ -24,8 +24,8 @@ chromadb-client==1.5.9
 # CrossEncoder.predict) if numpy resolves to a 2.x release. Keep numpy on
 # the 1.26.x line here until upgrading torch is possible on this machine.
 sentence-transformers==3.3.1
-torch==2.2.2
-numpy==1.26.4
+#torch==2.2.2
+#numpy==1.26.4
 
 # Persistent, cross-process conversation state (replaces the in-memory
 # sessions dict). Talks to the redis service in docker-compose.yml.
